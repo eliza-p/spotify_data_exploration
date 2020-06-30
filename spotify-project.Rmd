@@ -1,0 +1,538 @@
+---
+output: 
+  html_document:
+    theme: readable
+    code_folding: hide
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Spotify: An Exploration of Genres {.tabset}
+### by: Eliza Redwine
+
+## Introduction
+
+With 217 million active users listening to an average of 25 hours of music and other content a month, Spotify represents 42% of the streaming market and generates 30% of total revenue for the recorded music industry. [source - BusinessofApps](https://www.businessofapps.com/data/spotify-statistics/) Besides being big business, Spotify is also home to a countless number of user and Spotify created playlists capturing every mood, genre, and theme imaginable. 
+
+(This was created during the first quarantine of 2020 (future-proofing this) and the COVID-19 pandemic has been an especially fruitful inspiration for playlists. My current favorites are:
+
+* [Songs for Pandemics](https://open.spotify.com/playlist/5AVzl7JXFSH4ZgoJHQ6QV4?si=uT8vPcCnSD6peQxxp-VdoA) by Carlotta Freni; full of moody, melodic, and longing tracks by acts like The National, Grimes, and Thom Yorke
+* [COVID-19 Quarantine Party](https://open.spotify.com/playlist/55V6HUzPnISl7ADpE3yfUD?si=9unZxtchRRCSqw5u7c_qKw) by Alistair Ryan; a slightly more tongue-in-cheek, less genre-coherent take with songs like 'Toxic' by Britney Spears and 'Leaving, On a Jet Plane' by John Denver)
+
+In this project I am using a dataset created by Kaylin Pavlik and used in her [blogpost](https://www.kaylinpavlik.com/classifying-songs-genres/). She collected approximately 5,000 songs from each of the top 6 genres from Spotify and then used the audio features for each song to predict the playlist genre it belonged to. I'm less interested in prediction and more in understanding the commonalities and differences between genres. 
+
+I hope this exploratory data analysis provides both a nice understanding of the various audio features Spotify makes available and also helps you see what musical genres have in common and how they are different. 
+
+## Required Packages
+```{r libraries, warning=FALSE, message=FALSE}
+library(tidyverse) #importing and wrangling data
+library(treemap) #treemaps
+library(knitr) #kable tables
+library(arules) #association rules
+library(patchwork) #arranging ggplots
+
+#Setting a default ggplot theme to save some typing
+theme_set(
+  theme_dark() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = unit(c(0,0,0,0), "pt"),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 10, face = "bold"),
+      axis.ticks.x = element_blank(),
+      plot.title = element_text(hjust = 1, face = "bold"))
+)
+```
+## Data Wrangling
+
+In this project I am using a dataset created by Kaylin Pavlik and used in her [blogpost](https://www.kaylinpavlik.com/classifying-songs-genres/) where she collected 20 playlists from Spotify for each of the top 4 sub-genres of the top 6 genres (`edm`, `latin`, `pop`, `r&b`, `rap`, and `rock`) netting her approximately 5,000 songs from each genre. She then used the 12 audio features Spotify provides for each song to predict the playlist genre it belonged to. 
+
+The data was downloaded from the TidyTuesday collection and is available [here](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-01-21/readme.md). 
+```{r data}
+spot <- read_csv('spotify_songs.csv', col_types = cols(.default = '?', track_name = 'c', track_artist = 'c', track_album_name = 'c', playlist_name = 'c'))
+```
+The original dataset contained `r nrow(spot)` rows with each row representing a track of a playlist and `r ncol(spot)` variables. The variables given were:
+
+* 7 'track' features
+  + keys for the track id and track album id
+  + track and album name
+  + artist
+  + popularity
+  + release date; 
+* 4 'playlist' features
+  + a key for the playlist id 
+  + playlist name
+  + playlist genre and sub-genre; 
+* 12 'audio' features 
+  + qualitative variables for `danceability`, `energy`, `speechiness`, `acousticness`, `instrumentalness`, `liveness`, and `valence` on a scale from 0 to 1
+  + a categorical variable for key: 0 to 11
+  + average loudness in decibels
+  + a categorical variable for mode (major or minor)
+  + estimated tempo in beats per minute
+  + duration of the track in milliseconds 
+
+### Dealing With Duplicates
+
+Upon initial review, I noticed that `track_id` was not a unique key, this makes sense since the initial data set was created by pulling playlists rather than tracks. Many playlists may choose to use the same track. Below is a top 10 of most used tracks (*a* top 10 as there are quite a few tracks used 8 times). 
+```{r}
+dup_track <- spot %>%
+  count(track_id) %>% 
+  filter(n > 1) %>%
+  arrange(desc(n))
+
+top10_used <- left_join(dup_track, spot, by = 'track_id') %>%
+  select(track_id, track_name, track_artist, n) %>%
+  distinct()
+
+top10_used %>% select(-track_id) %>%
+  head(n = 10)
+```
+As you can see `r top10_used[[1, 'track_name']]` by `r top10_used[[1, 'track_artist']]` is the most used track. It is on the `r {top10_used[[1, 'n']]}` playlists below:
+```{r}
+top_n(top10_used, 1, n) %>%
+left_join(spot, by = 'track_id') %>%
+  select(playlist_name, playlist_id, playlist_genre, playlist_subgenre)
+```
+Of note, it appears that even a combination of track_id and playlist_id are not unique keys as we see that the playlist '2020 Hits & 2019 Hits - Top Global Tracks' appears 3 times, each appearance has a slightly different genre/sub-genre designation:
+
+* latin/latin pop,
+* latin/latin hip hop, and
+* r&b/hip pop
+
+I was interested in looking at both the songs themselves and the playlists they are put on so I created two additional tables to use in my data exploration: 'songs', a table containing unique song tracks and their associated audio features with a new primary key for each song and 'spot_songs_link', a lookup table which will allow joins between the 'songs' table and the original dataset using the primary key created in the 'songs' table and the track_id.
+
+To start with I will create the new dataframe 'songs_working' containing only the variables of interest: `track_id`, `track_name`, `track_artist`, and the 12 audio features and then remove any exact copies.
+```{r}
+songs_working <- select(spot, -starts_with('playlist'), -track_popularity, -starts_with('track_album')) %>%
+  distinct()
+```
+This takes the dataset down to `r nrow(songs_working)` rows from the `r nrow(spot)` rows in the original dataset. However, there are still some 'pseudo'-duplicates - tracks with the same name and artist, but different track_ids. The top 10 offenders are shown below:
+```{r warning = FALSE}
+(top10_repeats <- songs_working %>%
+   group_by(track_name, track_artist) %>%
+   summarise(count = n()) %>%
+   filter(count > 1)  %>%
+   arrange(desc(count)) %>%
+   head(n = 10))
+```
+To get an idea of why multiple track_ids are being assigned to tracks that appear similar, the 7 track_id associated with 'Livin' On  A Prayer' are shown below:
+```{r}
+head(top10_repeats, n = 1) %>%
+  left_join(spot, by = c('track_name', 'track_artist')) %>%
+  select(track_id, track_name, track_artist, track_album_name, track_album_id) %>%
+  distinct(track_id, .keep_all = TRUE) %>%
+  arrange(track_album_name) %>%
+  select(-track_id)
+```
+We can see that part of the problem is the same song being included on multiple albums, in this case the original album 'Slippery When Wet' and greatest hit albums; but there are also albums with the same or similar names with a different `track_album_id`. Perhaps these are country specific versions of the album since Spotify may have to deal with country-specific copyright laws and licensing deals?
+
+To deal with this, I will first subset out all unique track_name and track_artist combinations to continue building the start of the 'songs' dataset.
+```{r warning = FALSE}
+dup_count <- group_by(songs_working, track_name, track_artist) %>%
+  summarise(count = n())
+
+filter(dup_count, count == 1) %>%
+  left_join(songs_working, by = c('track_name', 'track_artist')) ->
+  songs_temp
+```
+Then I will separate out all the duplicates and join them to their associated tracks for further processing. As duplicates are resolved they will be appended to the songs dataset.
+```{r warning = FALSE}
+filter(dup_count, count != 1) %>%
+  left_join(songs_working, by = c('track_name', 'track_artist')) ->
+  dupes
+```
+The new temporary dataset 'dupes' contains `r nrow(dupes)` rows, while the start of the 'songs' table contains `r nrow(songs_working)` rows - this is as expected as our original working dataset of unique track_ids contained `r nrow(songs_working)` rows. 
+
+To start processing the duplicates I am going to give each distinct track_name track_artist pair a group id. For instance, all 7 versions of 'Livin' On A Prayer' by Bon Jovi will all have the same group id.
+```{r warning = FALSE}
+group_dupe <- select(dupes, track_name, track_artist) %>%
+  distinct()
+
+group_dupe$group_id <- 1:nrow(group_dupe)
+
+dupes <- left_join(dupes, group_dupe, by = c('track_name', 'track_artist'))
+
+filter(dupes, track_name == "Livin' On A Prayer") %>%
+  select(track_name, track_artist, count, group_id)
+```
+All group_ids where the tracks have identical audio characteristics (i.e., columns danceability:duration_ms) will be considered one song and are consolidated into the dataset 'songs1' below using their group_id as a unique song_id key. The table 'key1' below contains the lookup table to match song_id to the track_id given in the original dataset.
+```{r warning=FALSE, results ="hide", message=FALSE}
+collapse1_count <- select(dupes, track_name, track_artist, danceability:group_id) %>% 
+  distinct() %>%
+  group_by(group_id) %>%
+  summarise(count = n()) %>%
+  filter(count == 1)
+
+#remaining tracks
+bad_actors <- select(dupes, track_name, track_artist, danceability:group_id) %>% 
+  distinct() %>%
+  group_by(group_id) %>%
+  summarise(count = n()) %>%
+  filter(count != 1)
+
+#creating key-value lookup for the first set of group_id to track_id
+key1 <- left_join(collapse1_count, dupes, by = 'group_id') %>%
+  select(group_id, track_id) %>%
+  rename(song_id = group_id)
+
+#creating row for each clean group_id to add to songs dataset
+songs1 <- left_join(collapse1_count, dupes, by = 'group_id') %>%
+  select(group_id, track_name, track_artist, danceability:duration_ms) %>%
+  distinct() %>%
+  rename(song_id = group_id) #rename 'group_id' to song_id
+```
+A future project would be looking into how to process the remaining groups, it seems like you should be able to group songs with the same artist and track name and similar audio features as one song, potentially using the group mean as the 'ur-song'. This approach may be problematic though as you can see if the sample below where the last version of '(Don't Fear) The Reaper' by Blue Oyster Cult appears to be in a different key and mode and the second version has a different valence than the other two despite all being approximately the same length.
+```{r}
+bad_actors %>% 
+  left_join(dupes, by = 'group_id') %>%
+  select(group_id, track_name, track_artist, key, mode, valence, duration_ms) %>%
+  filter(group_id == 4)
+```
+This may reflect either that these are truly different versions of the same song, or that Spotify's detection for these features has more variability than anticipated. 
+
+I'm also a bit wary of this approach because after sampling random pairs of songs from the list of unique songs I couldn't get a good feel for how much you should expect two truly unique songs to vary - sometimes the sum of differences was quite large and sometimes almost non-existent. Even after sampling 10,000 pairs of songs, the variance in the sum of difference was too large for me to feel comfortable using that as a metric. So the 'bad actors' are going to get put on a list and if I ever solve this problem I can deal with them then. 
+
+There are `nrow(bad_actors)` 'bad actors'. 
+
+Continuing with the songs I was able to reconcile, I now combine the created song1 and key1 datasets to the already 'clean' songs by adding a song_id key to the existing songs_working dataset and creating a key-value lookup for song_id and track_id for those tracks.
+```{r warning = FALSE}
+#to ensure a unique key for song_id, I will store the max song_id currently in use and begin indexing the existing songs datset from there
+start_key <-  max(key1[,'song_id']) + 1
+
+songs_temp$song_id <- start_key:((start_key - 1) + nrow(songs_temp))
+
+spot_songs_link <- ungroup(songs_temp) %>%
+  select(song_id, track_id) %>%
+  rbind.data.frame(key1) %>%
+  arrange(song_id)
+
+songs <- ungroup(songs_temp) %>% 
+  select(-c(count, track_id)) %>%
+  select(song_id, track_name:duration_ms) %>%
+  rbind.data.frame(songs1) %>%
+  arrange(song_id)
+```
+The first 5 entries of the songs dataset is displayed below:
+```{r}
+head(songs, n = 5)
+```
+The first 5 rows of the new key-lookup table spot_songs_link is displayed here to show how the lookup table works for song_id that link to multiple track_ids:
+```{r}
+head(spot_songs_link, n = 5)
+```
+And the last 5 rows of spot_songs_link are displayed here to show the lookup table to song_id's that only link to one track
+```{r}
+tail(spot_songs_link, n = 5)
+```
+
+### Playlists
+
+These next two datasets will be used in data exploration. First I've made a dataset that links up each unique song to every playlist it's on. As noted above, some playlists are coded with multiple genre/sub-genres, so the combination of 'song_id' and 'playlist_id' is not a unique key here. 
+```{r}
+playlists_songs <- songs %>%
+  select(song_id, track_name, track_artist) %>%
+  left_join(select(spot_songs_link, song_id, track_id), by = "song_id") %>%
+  left_join(select(spot, c(track_id, playlist_id, playlist_name, playlist_genre, playlist_subgenre)), by = "track_id")
+```
+Next, I've used that dataset to create a frequency count based on how many songs are in each genre and sub-genre. Songs that are on playlists that have multiple genres are going to get double (and sometimes triple+) counted and inflate the total genre/sub-genre counts, but I think this is reasonable as it will give an idea of how genres actually correspond to sub-genres by including ambiguous cases.  
+```{r}
+playlists <- playlists_songs %>%
+  select(playlist_genre, playlist_subgenre) %>%
+  group_by(playlist_genre, playlist_subgenre) %>%
+  summarise(sub_genre_count = n()) %>%
+  left_join(summarise(group_by(select(playlists_songs, playlist_genre), playlist_genre), genre_count = n()), by = "playlist_genre")
+```
+
+## Exploring Playlists & Genre
+
+### Genre
+
+Genre is arguably the most important variable we have in this dataset as most people tend to seek out specific genres when choosing music instead of more abstract things like key or tempo.
+
+Kaylin Pavlik originally collected 20 playlists each from the top 4 sub-genres of each genre, so there's a slightly different number of songs collected from each genre. 
+
+We can see how the genres and sub-genres break down by looking at treeplot where the size of the squares represents the percentage that the genre makes up of the total. We can see that each genre has four sub-genres of varying sizes.
+```{r}
+treemap(playlists, 
+        index = c("playlist_genre", "playlist_subgenre"), 
+        vSize = "sub_genre_count", 
+        type = "index",
+        palette = "Spectral",
+        title = "")
+```
+
+The `rock` and `latin` blocks look slightly smaller and the `edm` and `rap` blocks look slightly larger - one hypothesis here is that edm and rap playlists tend to have more songs on them than rock or latin playlists.
+
+So let's look at a dot plot where each dot represents a playlist and the height of each dot represents how many songs the playlist had. We can see that it does look like edm playlists trend toward around 90-100 songs and that there are no rap playlists with fewer than about 30 songs.
+```{r warning = FALSE, message=FALSE}
+color_scale <- c("#9E0142", "#D53E4F", "#F46D43", "#FDAE61", "#FEE08B", "#FFFFBF")
+
+gcolor <- "#abdda4"
+
+playlists_songs %>% 
+  group_by(playlist_genre, playlist_name) %>%
+  summarise(song_count = n()) %>%
+  ggplot(mapping = aes(x = playlist_genre, y = song_count, fill = playlist_genre, color = playlist_genre)) +
+  scale_fill_manual(values = color_scale) +
+  scale_color_manual(values = color_scale) +
+  geom_dotplot(binaxis = "y", stackdir = "center", dotsize = .5, show.legend = FALSE) +
+  labs(y = "songs", x = "")
+```
+
+We also see some super-long playlists - here are the 10 longest:
+```{r}
+playlists_songs %>% 
+  group_by(playlist_genre, playlist_name) %>%
+  summarise(song_count = n()) %>%
+  ungroup() %>%
+  arrange(desc(song_count)) %>%
+  top_n(10, wt = song_count) %>%
+  select(Playlist = playlist_name, Genre = playlist_genre, Songs = song_count) %>%
+  kable()
+```
+
+As mentioned in the data wrangling section, some playlists are duplicated because Spotify has coded the same playlist with multiple genre/sub-genre categories, in addition, lots of songs are on multiple playlists and these playlists may not all be in the same genre. So, let's take a look at these versatile songs. 
+
+```{r}
+multi_genre <- playlists_songs %>% 
+  distinct(song_id, playlist_genre, playlist_subgenre) %>%
+  group_by(song_id) %>%
+  summarise(genre_count = n()) %>%
+  ungroup() %>%
+  left_join(select(playlists_songs, song_id, track_name, track_artist, playlist_genre, playlist_subgenre), by = "song_id") %>%
+  arrange(desc(genre_count)) %>%
+  select(track = track_name, artist = track_artist, genre = playlist_genre, sub_genre = playlist_subgenre, genres = genre_count, song_id) %>%
+  filter(genres > 1)
+```
+There are `r nrow(distinct(multi_genre, song_id))` songs that are on playlists with different genres. "`r select(top_n(multi_genre, 1, wt=genres), track)[[1,1]]`" by *`r select(top_n(multi_genre, 1, wt=genres), artist)[[1,1]]`* is on playlists of a baffling `r select(top_n(multi_genre, 1, wt=genres), genres)[[1,1]]` genres which is probably why is was nearly inescapable a few years ago. 
+
+Here are all the genres that the song was classed as (I'm most bewildered by the southern hip hop and latin-tropical designations):
+```{r}
+multi_genre %>%
+  select(-song_id) %>%
+  top_n(1, wt = genres) %>%
+  select(-genres) %>%
+  kable()
+```
+
+### Genre Association Rules
+
+For the songs that are classed as multiple genres, it would be interesting to see if there are groups of genres that typically appear together - for instance if there were a lot of songs that were classified as both 'latin - latin pop' and 'r&b - hip pop'. 
+
+We can use the apriori algorithm to look for combinations that occur frequently. The rules can be interpreted that among our songs with multiple genres, if we see a song on a playlist with the sub-genre listed in the column 'LHS' we can be reasonably sure that it will also be on a playlist with the sub-genre listed in the column 'RHS'. The 'confidence' column tells us what percentage of times a song on a playlist of the LHS sub-genre is also on a playlist of the RHS sub-genre while 'count' tells us how many times this rule popped up. 
+```{r results='hide', warning=FALSE, message=FALSE}
+#transform multi-genre dataset to use with arules
+genre_basket <- multi_genre %>%
+  mutate(genre_tag = str_c(genre, sub_genre, sep = " - ")) %>%
+  mutate(indicator = 1) %>% 
+  select(song_id, genre_tag, indicator) %>%
+  distinct() %>%
+  pivot_wider(names_from = genre_tag,
+              values_from = indicator,
+              values_fill = list(indicator = 0))
+
+genre_arules <- as(as.matrix(genre_basket[, -1]), "transactions")
+
+genre_rules <- apriori(genre_arules, parameter = list(sup = 0.001, conf = 0.50, target = "rules", maxlen = 2))
+```
+```{r}
+DATAFRAME(genre_rules) %>%
+  arrange(desc(lift)) %>%
+  select(-support, -lift) %>%
+  mutate(confidence = round(confidence, 2)) %>%
+  kable
+```
+
+
+### Audio Features and Genre
+
+Now let's look at how the various audio features Spotify provides interact with genre. 
+
+We already know that some of our songs show up on playlists with different genres - these are going to muddy the water a bit when we're trying to detect differences and similarities between genres, so to start with, we'll subset our songs dataset so that we're only including songs that are on playlists of a single genre.
+```{r}
+one_genre <- playlists_songs %>% 
+  distinct(song_id, playlist_genre) %>%
+  group_by(song_id) %>%
+  summarise(genre_count = n()) %>%
+  ungroup() %>%
+  filter(genre_count == 1) %>%
+  left_join(select(playlists_songs, playlist_genre, song_id), by = "song_id") %>%
+  left_join(songs, by = "song_id") %>%
+  rename(track = track_name, artist = track_artist, genre = playlist_genre, genres = genre_count) %>%
+  distinct()
+```
+This leaves us with **`r nrow(one_genre)`** songs. 
+
+As we go through each audio feature, if you ever want more information on how Spotify defines any of the features or how they come up with their scores, check out their [developer site](https://developer.spotify.com/documentation/web-api/reference/tracks/get-audio-features/)). 
+
+#### right-skew for days - speechiness, acousticness, and liveness
+
+First, let's look at `speechiness`, `acousticness`, and `liveness` as these all have long right tails. Spotify gives each song a score between 0 and 1 for each of these metrics where 0 is not at all speechy/acoustic/live and 1 is very. 
+
+On the `speechiness` plot you can see dotted lines at 0.33 and 0.66 - this is based on Spotify's documentation where they say that anything above 0.66 is highly likely to be just speech (like a podcast) and anything between 0.33 and 0.66 likely contains both musical sections and speech sections (like some rap music). Looking at the plot, we can see that `pop` and `rock` music are not at all 'speechy' while `r&b` and `rap` have much flatter distributions and more range in how 'speechy' their songs are.
+
+`acousticness` is an interesting metric because Spotify indicates you can only be highly confident that a song is actually acoustic if it has a score of 1. From the steep vertical cliff at the start of each plot, we can see there are a lot of songs with an `acousticness` score of 0 - `edm` music in particular has almost no density beyond about 0.2 (which makes sense since the 'e' stands for electronic). 
+
+The `liveness` plot has a dip and bump at around 0.3 for every genre - I'm really curious what is causing this as I can't think of any explanation - this could be interesting to explore in the future. The dashed line at 0.8 indicates the point at which Spotify says we can be confident that a song was actually performed live. 
+
+```{r}
+atr_list <- c("speechiness", "acousticness", "liveness")
+
+plot_list <- list()
+
+for (i in seq_along(atr_list)) {
+  
+  plot_list[[i]] <- one_genre %>%
+    ggplot(mapping = aes_string(x = atr_list[i], color = "genre", fill = "genre")) +
+    scale_color_manual(values = color_scale) +
+    scale_fill_manual(values = color_scale) +
+    geom_density(show.legend = FALSE) +
+    facet_grid(genre ~ .) +
+    ggtitle(atr_list[i]) +
+    theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank())
+}
+
+plot_list[[1]] <- plot_list[[1]] + 
+  geom_vline(xintercept = c(0.33, 0.66), linetype = "longdash", color = "grey90") +
+  scale_x_continuous(breaks = c(0, 0.33, 0.66, 1)) + 
+  theme(strip.background = element_blank(),
+        strip.text.y = element_blank())
+
+plot_list[[2]] <- plot_list[[2]] +
+  geom_vline(xintercept = 1, linetype = "longdash", color = "grey90") +
+  scale_x_continuous(breaks = c(0, 1.0)) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_blank())
+
+plot_list[[3]] <- plot_list[[3]] +
+  geom_vline(xintercept = 0.8, linetype = "longdash", color = "grey90") +
+  scale_x_continuous(breaks = c(0, .3, 0.8, 1))
+
+plot_list[[1]] + plot_list[[2]] + plot_list[[3]] 
+```
+
+#### how long is that song? 
+
+The green density plot shows the overall distribution of song length and the white dashed line is right at 3 minutes, so it does look like we've relaxed the old standards of the [10 inch record / 3 minute single](https://www.classicfm.com/discover-music/why-are-pop-songs-3-minutes/) at least somewhat - songs have gotten longer anyway, the density plot is still quite steep showing us that most songs are somewhere between 3 and 5 minutes.
+
+The box plot helps illustrate the differences in song length between genres. I think the most interesting thing here is how much narrower the range is for latin and pop and songs as well as the number of outliers - it would be interesting to see if much longer and much shorter songs are otherwise similar to other songs in the same genre or if they are outliers on multiple fronts.
+
+```{r, echo=FALSE}
+c <- one_genre %>%
+  ggplot(mapping = aes(x = duration_ms/60000)) +
+  geom_density(color = gcolor, fill = gcolor) +
+  geom_vline(xintercept = 3.0, linetype = "longdash", color = "grey98") +
+  labs(x = "minutes", y = "") +
+  scale_x_continuous(breaks = c(0, 3, 5, 7)) +
+  theme(axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank())
+
+d <- one_genre %>% 
+  ggplot(mapping = aes(x = genre, y = duration_ms/60000, color = genre)) +
+  scale_color_manual(values = color_scale) +
+  geom_boxplot(fill = "grey50", show.legend = FALSE) +
+  labs(x = "", y = "") +
+  scale_y_continuous(breaks = c(0, 3, 5, 7))
+
+c + d + plot_annotation(title = 'song length')
+```
+
+#### ([not quite my](https://youtu.be/xDAsABdkWSc?t=18)) tempo
+
+A violin plot can help us visualize the distribution of `tempo` - wider portions of the graph indicate that there are more songs at that tempo. This is a fun plot because we can see that most genres actually have quite a lot of variation in tempo except for `edm`. I don't know much about edm as a genre, but it definitely seems like everyone has decided that approximately 130 bpm is the sweet spot for an edm track. 
+  
+```{r}
+(tempo <- one_genre %>% 
+  ggplot(mapping = aes(y = tempo, x = genre, color = genre, fill = genre)) +
+  scale_color_manual(values = color_scale) +
+  scale_fill_manual(values = color_scale) +
+  geom_violin(show.legend = FALSE) +
+  labs(y = "beats per minute", title = "tempo") +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank()))
+```
+
+#### dance, dance
+`danceability` is another perceptual metric that Spotify ranks from 0 (not at all) to 1 (very), one of the metrics Spotify uses to determine `danceability` is 'rhythm stability' which is why I think the `rap` genre has so many songs with a high danceabilty score - because while there is danceable rap music, I would not say that is a defining characteristic of the genre. 
+
+The other plots make some intuitive sense - `rock` is not a very danceable genre and all our other genres have lots of danceable songs but also pretty much variation. 
+
+```{r}
+(dance <- one_genre %>% 
+  ggplot(mapping = aes(x = danceability, color = genre, fill = genre)) +
+  scale_color_manual(values = color_scale) +
+  scale_fill_manual(values = color_scale) +
+  geom_density(show.legend = FALSE) +
+  facet_grid(genre ~ .) +
+  ggtitle("danceability") +
+  scale_x_continuous(breaks = c(0, .5, 1)) +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank()))
+```
+
+#### shiny happy songs
+
+Finally, let's look at `valence` and `energy`. Spotify ranks both of these from 0 to 1. Songs with a lower score for `valence` are more negative and songs with a higher score are more positive - Spotify characterizes low valence as "sad, depressed, angry" and high valence as "happy, cheerful, euphoric". Songs with high `energy` are characterized as "fast, loud, and noisy".
+
+I was curious how these two measures would interact in different genres, so I plotted hexplots for each genre. Darker colored areas on these plots indicate that there are more songs at that `valence` and `energy` level while grey areas indicate no songs.
+
+We can see that `edm` and `rock` are both high energy genres, but that that energy does not necessarily correspond to high valence. `edm` in particular is both high energy and low valence - I'm curious if this is a reflection of the genre or with how Spotify attempts to classify valence - maybe edm is registering at low valence because Spotify interprets electronic sounds as less positive than human sounds?
+
+`pop`, `r&b`, and `rap` all show a lot of variation, but seem to be centered around relatively high energy and medium valence. `latin` music has noticeably more songs with high valence than any other genre. 
+```{r}
+genre_list <- c("edm", "latin", "pop", "r&b", "rap", "rock")
+
+plot_list = list()
+
+for (i in seq_along(genre_list)) {
+  df <- filter(one_genre, genre == genre_list[i])
+  
+  p <- df %>% 
+    ggplot(mapping = aes(x = energy, y = valence)) +
+    scale_fill_gradient(low = "grey50", high = color_scale[i]) +
+    geom_hex(bins = 20, show.legend = FALSE) +
+    labs(x = "", y = "", title = genre_list[i]) +
+    theme(axis.title = element_text(size = 14, face = "bold"), 
+          plot.title = element_text(size = 10),
+          axis.ticks = element_blank(),
+          axis.text = element_blank())
+  
+  plot_list[[i]] <- p
+}
+
+plot_list[[1]] <- plot_list[[1]] +
+  ylab("valence")
+
+plot_list[[6]] <- plot_list[[6]] +
+  xlab("energy")
+  
+
+((plot_list[[1]] + plot_list[[2]] + plot_list[[3]]) /
+  (plot_list[[4]] + plot_list[[5]] + plot_list[[6]]))
+```
+
+### Summary
+
+We've looked at most of the audio features that Spotify provides at the track level and identified some key similarities and differences between genres, like:
+
+- `rap` and `r&b` music is more 'speechy' than other genres
+- most songs are between 3 and 5 minutes, but `pop` and `latin` tracks have a tighter range and are mostly between 3 and 4 minutes
+- tempo varies a lot for most genres, except `edm` which shows a lot of tracks at around 130 bpm
+- `rock` is the least danceable genre
+- energy and valence aren't necessarily correlated
+
+There are so many interesting things you could do with Spotify data and I hope this project has made you think of some questions you'd like to explore. I'm most curious about:
+
+- Can you design a metric which differentiates between a slightly different recording of the same song and two entirely different songs?
+- How would splitting latin music into more categories affect our understanding of that genre? Currently that genre has two sub-genres that seem like very different types of music 'latin hip hop' and 'latin pop'. In general, is there more variation within genres than between?
+- What is that 'bump' in the `liveness` plot?
+
+
+
